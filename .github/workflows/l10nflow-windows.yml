@@ -1,0 +1,74 @@
+name: L10nFlow web
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        required: true
+        type: string
+      installer_version:
+        required: true
+        type: string
+      dispatch_id:
+        required: true
+        type: string
+run-name: l10nflow:${{ inputs.candidate_sha }}:${{ inputs.installer_version }}:${{ inputs.dispatch_id }}
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      BUILD_VERSION: ${{ inputs.installer_version }}
+      L10NFLOW_CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+    steps:
+      - name: Check out the locked candidate
+        env:
+          CHECKOUT_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$L10NFLOW_CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$BUILD_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          git init source
+          credential=$(printf 'x-access-token:%s' "$CHECKOUT_TOKEN" | base64 -w0)
+          printf '::add-mask::%s\n' "$credential"
+          GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+            GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $credential" \
+            git -C source fetch --depth=1 --no-tags --no-recurse-submodules \
+              "https://github.com/$GITHUB_REPOSITORY.git" "$L10NFLOW_CANDIDATE_SHA"
+          git -C source checkout --detach --no-recurse-submodules FETCH_HEAD
+          test "$(git -C source rev-parse HEAD)" = "$L10NFLOW_CANDIDATE_SHA"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '26.13.1'
+      - name: Install locked dependencies
+        working-directory: source
+        run: |
+          curl -fsS --max-time 15 https://registry.npmjs.org/pnpm/12.14.0 -o /dev/null
+          npm install -g pnpm@12.14.0
+          pnpm install --frozen-lockfile
+      - name: Build the localized Web bundle
+        working-directory: source
+        env:
+          T3CODE_WEB_SOURCEMAP: 'false'
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('apps/web/src/router.ts')
+          text = path.read_text()
+          assert text.count('    routeTree,') == 1
+          route = '    routeTree,'
+          prefix = '    basepath: import.meta.env.BASE_URL,'
+          path.write_text(text.replace(route, route + chr(10) + prefix))
+          PY
+          pnpm --filter @t3tools/web build --base=/l10nflow-nightly/
+          cd apps/web/dist
+          test -s index.html
+          zip -q -r "$RUNNER_TEMP/web-bundle.zip" .
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: l10nflow-web
+          path: ${{ runner.temp }}/web-bundle.zip
+          if-no-files-found: error
